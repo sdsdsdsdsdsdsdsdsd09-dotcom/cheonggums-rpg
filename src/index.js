@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
+const MAX_PLAYERS_PER_ROOM = 4;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -9,10 +11,7 @@ export default {
     }
 
     const match = url.pathname.match(/^\/room\/([^/]+)$/);
-
-    if (!match) {
-      return new Response("청구 RPG 멀티 서버", { status: 200 });
-    }
+    if (!match) return new Response("청구 RPG 멀티 서버", { status: 200 });
 
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("WebSocket 연결이 필요합니다.", { status: 426 });
@@ -20,16 +19,14 @@ export default {
 
     const roomId = decodeURIComponent(match[1]);
     const id = env.ROOMS.idFromName(roomId);
-    const room = env.ROOMS.get(id);
-
-    return room.fetch(request);
+    return env.ROOMS.get(id).fetch(request);
   }
 };
 
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-    this.clients = new Set();
+    this.clients = new Map();
   }
 
   async fetch(request) {
@@ -37,26 +34,32 @@ export class GameRoom extends DurableObject {
       return new Response("WebSocket only", { status: 426 });
     }
 
-    if (this.clients.size >= 2) {
-      return new Response("방이 가득 찼습니다.", { status: 409 });
+    if (this.clients.size >= MAX_PLAYERS_PER_ROOM) {
+      return new Response("방이 가득 찼습니다. 최대 4명까지 입장할 수 있습니다.", { status: 409 });
     }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
+    const connectionId = crypto.randomUUID();
 
     server.accept();
-    this.clients.add(server);
+    this.clients.set(server, connectionId);
 
     server.send(JSON.stringify({
       type: "connected",
-      players: this.clients.size
+      players: this.clients.size,
+      maxPlayers: MAX_PLAYERS_PER_ROOM,
+      id: connectionId
     }));
 
-    for (const other of this.clients) {
+    for (const [other] of this.clients) {
       if (other !== server) {
         try {
           other.send(JSON.stringify({
-            type: "player_joined"
+            type: "player_joined",
+            id: connectionId,
+            players: this.clients.size,
+            maxPlayers: MAX_PLAYERS_PER_ROOM
           }));
         } catch {
           this.clients.delete(other);
@@ -65,7 +68,7 @@ export class GameRoom extends DurableObject {
     }
 
     server.addEventListener("message", (event) => {
-      for (const other of this.clients) {
+      for (const [other] of this.clients) {
         if (other !== server) {
           try {
             other.send(event.data);
@@ -77,12 +80,16 @@ export class GameRoom extends DurableObject {
     });
 
     const remove = () => {
+      const id = this.clients.get(server);
       this.clients.delete(server);
 
-      for (const other of this.clients) {
+      for (const [other] of this.clients) {
         try {
           other.send(JSON.stringify({
-            type: "player_left"
+            type: "player_left",
+            id,
+            players: this.clients.size,
+            maxPlayers: MAX_PLAYERS_PER_ROOM
           }));
         } catch {
           this.clients.delete(other);
@@ -93,10 +100,6 @@ export class GameRoom extends DurableObject {
     server.addEventListener("close", remove);
     server.addEventListener("error", remove);
 
-    return new Response(null, {
-      status: 101,
-      webSocket: client
-    });
+    return new Response(null, { status: 101, webSocket: client });
   }
 }
-// Cloudflare Workers 첫 자동 배포
