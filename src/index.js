@@ -35,11 +35,33 @@ export class GameRoom extends DurableObject {
     this.clients = new Map();
     this.hostId = "";
 
-    // 방의 최신 월드 상태
+    // 현재 방의 최신 월드 상태
     this.lastWorldSnapshot = null;
 
-    // 방의 최신 몬스터 상태
+    // 현재 방의 최신 몬스터 상태
     this.lastMonsterSnapshot = null;
+  }
+
+  broadcast(data, exceptSocket = null) {
+    for (const [socket] of this.clients) {
+      if (socket === exceptSocket) continue;
+
+      try {
+        socket.send(data);
+      } catch {
+        this.clients.delete(socket);
+      }
+    }
+  }
+
+  socketForPlayer(id) {
+    for (const [socket, playerId] of this.clients) {
+      if (String(playerId) === String(id)) {
+        return socket;
+      }
+    }
+
+    return null;
   }
 
   async fetch(request) {
@@ -64,6 +86,7 @@ export class GameRoom extends DurableObject {
     const connectionId = crypto.randomUUID();
 
     server.accept();
+
     this.clients.set(server, connectionId);
 
     // 첫 번째 플레이어가 방장
@@ -71,137 +94,212 @@ export class GameRoom extends DurableObject {
       this.hostId = connectionId;
     }
 
-    // 서버가 사용하는 실제 플레이어 ID 전달
     server.send(
       JSON.stringify({
         type: "connected",
-        players: this.clients.size,
-        maxPlayers: MAX_PLAYERS_PER_ROOM,
         id: connectionId,
-        hostId: this.hostId
+        hostId: this.hostId,
+        players: this.clients.size,
+        maxPlayers: MAX_PLAYERS_PER_ROOM
       })
     );
 
-    // 새 플레이어에게 최신 월드 상태 전달
+    // 새 플레이어에게 현재 월드 전달
     if (this.lastWorldSnapshot) {
       try {
         server.send(this.lastWorldSnapshot);
       } catch {}
     }
 
-    // 새 플레이어에게 최신 몬스터 상태 전달
+    // 새 플레이어에게 현재 몬스터 상태 전달
     if (this.lastMonsterSnapshot) {
       try {
         server.send(this.lastMonsterSnapshot);
       } catch {}
     }
 
-    // 기존 플레이어들에게 새 플레이어 입장 알림
-    for (const [other] of this.clients) {
-      if (other === server) continue;
-
-      try {
-        other.send(
-          JSON.stringify({
-            type: "player_joined",
-            id: connectionId,
-            players: this.clients.size,
-            maxPlayers: MAX_PLAYERS_PER_ROOM,
-            hostId: this.hostId
-          })
-        );
-      } catch {
-        this.clients.delete(other);
-      }
-    }
+    // 기존 플레이어에게 입장 알림
+    this.broadcast(
+      JSON.stringify({
+        type: "player_joined",
+        id: connectionId,
+        hostId: this.hostId,
+        players: this.clients.size,
+        maxPlayers: MAX_PLAYERS_PER_ROOM
+      }),
+      server
+    );
 
     server.addEventListener("message", (event) => {
-      let message = null;
+      let msg = null;
 
       try {
-        message = JSON.parse(event.data);
-      } catch {}
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
 
       const senderId = this.clients.get(server);
 
-      // 서버 기준 방장인지 확인
-      const isHostMessage =
-        !!senderId && senderId === this.hostId;
-
-      // 방장이 보낸 월드 상태 저장
-      if (
-        isHostMessage &&
-        message?.type === "world_snapshot"
-      ) {
-        this.lastWorldSnapshot = event.data;
+      if (!senderId) {
+        return;
       }
 
-      // 방장이 보낸 몬스터 상태 저장
-      if (
-        isHostMessage &&
-        message?.type === "monster_state"
-      ) {
-        this.lastMonsterSnapshot = event.data;
-      }
-
-      // 같은 방의 다른 플레이어에게 전달
-      for (const [other] of this.clients) {
-        if (other === server) continue;
-
-        try {
-          other.send(event.data);
-        } catch {
-          this.clients.delete(other);
+      // ---------------------------------------------------------
+      // 방장 월드 스냅샷
+      // ---------------------------------------------------------
+      if (msg.type === "world_snapshot") {
+        if (String(senderId) !== String(this.hostId)) {
+          return;
         }
+
+        this.lastWorldSnapshot = event.data;
+        this.broadcast(event.data, server);
+        return;
       }
+
+      // ---------------------------------------------------------
+      // 방장 몬스터 스냅샷
+      // ---------------------------------------------------------
+      if (msg.type === "monster_state") {
+        if (String(senderId) !== String(this.hostId)) {
+          return;
+        }
+
+        this.lastMonsterSnapshot = event.data;
+        this.broadcast(event.data, server);
+        return;
+      }
+
+      // ---------------------------------------------------------
+      // 플레이어 상태 / 위치
+      // ---------------------------------------------------------
+      if (msg.type === "state") {
+        this.broadcast(event.data, server);
+        return;
+      }
+
+      // ---------------------------------------------------------
+      // 비방장의 몬스터 공격
+      // → 방장에게만 전달
+      // ---------------------------------------------------------
+      if (msg.type === "monster_attack") {
+        if (String(senderId) === String(this.hostId)) {
+          return;
+        }
+
+        // 다른 사람의 ID를 사칭하지 못하게 확인
+        if (
+          String(msg.attackerId || "") !==
+          String(senderId)
+        ) {
+          return;
+        }
+
+        const hostSocket = this.socketForPlayer(
+          this.hostId
+        );
+
+        if (hostSocket) {
+          try {
+            hostSocket.send(event.data);
+          } catch {}
+        }
+
+        return;
+      }
+
+      // ---------------------------------------------------------
+      // 방장이 비방장에게 몬스터 피해 전달
+      // ---------------------------------------------------------
+      if (msg.type === "monster_hit_player") {
+        if (
+          String(senderId) !==
+          String(this.hostId)
+        ) {
+          return;
+        }
+
+        const targetSocket =
+          this.socketForPlayer(msg.targetId);
+
+        if (targetSocket) {
+          try {
+            targetSocket.send(event.data);
+          } catch {}
+        }
+
+        return;
+      }
+
+      // ---------------------------------------------------------
+      // 기타 메시지
+      // ---------------------------------------------------------
+      this.broadcast(event.data, server);
     });
 
-    const remove = () => {
+    let removed = false;
+
+    const removePlayer = () => {
+      if (removed) {
+        return;
+      }
+
+      removed = true;
+
       const id = this.clients.get(server);
 
       const wasHost =
-        id === this.hostId;
+        String(id) ===
+        String(this.hostId);
 
       this.clients.delete(server);
 
-      // 방장이 나가면 다음 사람을 방장으로
+      // 방장이 나가면 다음 사람을 새 방장으로 지정
       if (wasHost) {
-        const next = this.clients.values().next();
+        const next =
+          this.clients.values().next();
 
         this.hostId = next.done
           ? ""
           : next.value;
 
-        // 기존 방장 기준 월드 데이터 제거
+        // 이전 방장 기준 월드는 폐기
         this.lastWorldSnapshot = null;
         this.lastMonsterSnapshot = null;
       }
 
-      for (const [other] of this.clients) {
-        try {
-          other.send(
-            JSON.stringify({
-              type: "player_left",
-              id,
-              players: this.clients.size,
-              maxPlayers: MAX_PLAYERS_PER_ROOM,
-              hostId: this.hostId
-            })
-          );
-        } catch {
-          this.clients.delete(other);
-        }
+      this.broadcast(
+        JSON.stringify({
+          type: "player_left",
+          id,
+          hostId: this.hostId,
+          players: this.clients.size,
+          maxPlayers: MAX_PLAYERS_PER_ROOM
+        })
+      );
+
+      // 새 방장 알림
+      if (wasHost && this.hostId) {
+        this.broadcast(
+          JSON.stringify({
+            type: "room_host",
+            hostId: this.hostId,
+            players: this.clients.size,
+            maxPlayers: MAX_PLAYERS_PER_ROOM
+          })
+        );
       }
     };
 
     server.addEventListener(
       "close",
-      remove
+      removePlayer
     );
 
     server.addEventListener(
       "error",
-      remove
+      removePlayer
     );
 
     return new Response(null, {
