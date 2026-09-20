@@ -33,15 +33,13 @@ export class GameRoom extends DurableObject {
     super(ctx, env);
 
     this.clients = new Map();
-    this.playerStates = new Map();
-
     this.hostId = "";
 
-    // 방장이 마지막으로 보낸 월드 상태
-    this.lastHostState = null;
+    // 방의 최신 월드 상태
+    this.lastWorldSnapshot = null;
 
-    // 방장이 마지막으로 보낸 몬스터 상태
-    this.lastMonsterState = null;
+    // 방의 최신 몬스터 상태
+    this.lastMonsterSnapshot = null;
   }
 
   async fetch(request) {
@@ -66,15 +64,14 @@ export class GameRoom extends DurableObject {
     const connectionId = crypto.randomUUID();
 
     server.accept();
-
     this.clients.set(server, connectionId);
 
-    // 첫 번째 플레이어가 방장이 됩니다.
+    // 첫 번째 플레이어가 방장
     if (!this.hostId) {
       this.hostId = connectionId;
     }
 
-    // 새 플레이어에게 기본 연결 정보 전달
+    // 서버가 사용하는 실제 플레이어 ID 전달
     server.send(
       JSON.stringify({
         type: "connected",
@@ -85,30 +82,21 @@ export class GameRoom extends DurableObject {
       })
     );
 
-    // 이미 들어와 있는 플레이어들의 최신 상태를 즉시 전달
-    for (const [id, state] of this.playerStates) {
-      if (id === connectionId || !state) continue;
-
+    // 새 플레이어에게 최신 월드 상태 전달
+    if (this.lastWorldSnapshot) {
       try {
-        server.send(state);
+        server.send(this.lastWorldSnapshot);
       } catch {}
     }
 
-    // 방장의 마지막 월드 상태를 즉시 전달
-    if (this.lastHostState) {
+    // 새 플레이어에게 최신 몬스터 상태 전달
+    if (this.lastMonsterSnapshot) {
       try {
-        server.send(this.lastHostState);
+        server.send(this.lastMonsterSnapshot);
       } catch {}
     }
 
-    // 방장의 마지막 몬스터 상태를 즉시 전달
-    if (this.lastMonsterState) {
-      try {
-        server.send(this.lastMonsterState);
-      } catch {}
-    }
-
-    // 기존 플레이어에게 새 플레이어 입장 알림
+    // 기존 플레이어들에게 새 플레이어 입장 알림
     for (const [other] of this.clients) {
       if (other === server) continue;
 
@@ -134,25 +122,26 @@ export class GameRoom extends DurableObject {
         message = JSON.parse(event.data);
       } catch {}
 
-      // 플레이어 상태 저장
-      if (message?.type === "state" && message.id) {
-        this.playerStates.set(
-          String(message.id),
-          event.data
-        );
+      const senderId = this.clients.get(server);
 
-        // 방장 상태 저장
-        if (String(message.id) === String(this.hostId)) {
-          this.lastHostState = event.data;
-        }
+      // 서버 기준 방장인지 확인
+      const isHostMessage =
+        !!senderId && senderId === this.hostId;
+
+      // 방장이 보낸 월드 상태 저장
+      if (
+        isHostMessage &&
+        message?.type === "world_snapshot"
+      ) {
+        this.lastWorldSnapshot = event.data;
       }
 
-      // 방장 몬스터 상태 저장
+      // 방장이 보낸 몬스터 상태 저장
       if (
-        message?.type === "monster_state" &&
-        String(message.hostId || "") === String(this.hostId)
+        isHostMessage &&
+        message?.type === "monster_state"
       ) {
-        this.lastMonsterState = event.data;
+        this.lastMonsterSnapshot = event.data;
       }
 
       // 같은 방의 다른 플레이어에게 전달
@@ -171,12 +160,11 @@ export class GameRoom extends DurableObject {
       const id = this.clients.get(server);
 
       const wasHost =
-        String(id) === String(this.hostId);
+        id === this.hostId;
 
       this.clients.delete(server);
-      this.playerStates.delete(String(id));
 
-      // 방장이 나갔으면 다음 플레이어를 새 방장으로 지정
+      // 방장이 나가면 다음 사람을 방장으로
       if (wasHost) {
         const next = this.clients.values().next();
 
@@ -184,12 +172,11 @@ export class GameRoom extends DurableObject {
           ? ""
           : next.value;
 
-        // 기존 방장 월드 상태는 폐기
-        this.lastHostState = null;
-        this.lastMonsterState = null;
+        // 기존 방장 기준 월드 데이터 제거
+        this.lastWorldSnapshot = null;
+        this.lastMonsterSnapshot = null;
       }
 
-      // 나머지 플레이어에게 퇴장 알림
       for (const [other] of this.clients) {
         try {
           other.send(
