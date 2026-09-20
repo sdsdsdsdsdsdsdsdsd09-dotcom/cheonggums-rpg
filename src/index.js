@@ -1,33 +1,124 @@
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS_PER_ROOM = 10;
-const MAX_MESSAGE_BYTES = 64 * 1024;
-const EVENT_TTL_MS = 15000;
-const MAX_EVENTS = 5000;
-const ATTACKS_PER_SECOND = 30;
+const activeRooms = new Map();
+const ROOM_LIST_TTL_MS = 2 * 60 * 1000;
 
-function safeJsonParse(text) {
-  try { return JSON.parse(text); } catch { return null; }
+function roomListResponse(request) {
+  const origin = request.headers.get("Origin") || "*";
+  const now = Date.now();
+
+  for (const [code, room] of activeRooms) {
+    if (
+      !room ||
+      room.players <= 0 ||
+      now - room.lastSeen > ROOM_LIST_TTL_MS
+    ) {
+      activeRooms.delete(code);
+    }
+  }
+
+  const rooms = [...activeRooms.values()]
+    .sort(
+      (a, b) =>
+        b.players - a.players || a.code.localeCompare(b.code)
+    )
+    .slice(0, 50);
+
+  return new Response(
+    JSON.stringify({
+      rooms,
+      ts: now
+    }),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type"
+      }
+    }
+  );
+}
+
+function updateActiveRoom(code, players, hostName = "") {
+  if (!code) return;
+
+  const prev = activeRooms.get(code) || {};
+  const count = Math.max(
+    0,
+    Math.min(MAX_PLAYERS_PER_ROOM, Number(players) || 0)
+  );
+
+  if (!count) {
+    activeRooms.delete(code);
+    return;
+  }
+
+  activeRooms.set(code, {
+    code: String(code).slice(0, 64),
+    players: count,
+    hostName: String(
+      hostName || prev.hostName || ""
+    ).slice(0, 16),
+    lastSeen: Date.now()
+  });
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 서버 상태 확인
     if (url.pathname === "/health") {
       return new Response("청구 RPG 멀티 서버 정상 작동");
     }
 
+    // 방 목록
+    if (url.pathname === "/rooms") {
+      if (request.method === "OPTIONS") {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin":
+              request.headers.get("Origin") || "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type"
+          }
+        });
+      }
+
+      if (request.method !== "GET") {
+        return new Response("Method Not Allowed", {
+          status: 405
+        });
+      }
+
+      return roomListResponse(request);
+    }
+
+    // 방 접속
     const match = url.pathname.match(/^\/room\/([^/]+)$/);
+
     if (!match) {
-      return new Response("청구 RPG 멀티 서버", { status: 200 });
+      return new Response("청구 RPG 멀티 서버", {
+        status: 200
+      });
     }
 
     if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("WebSocket 연결이 필요합니다.", { status: 426 });
+      return new Response(
+        "WebSocket 연결이 필요합니다.",
+        {
+          status: 426
+        }
+      );
     }
 
     const roomId = decodeURIComponent(match[1]);
+
     const id = env.ROOMS.idFromName(roomId);
     return env.ROOMS.get(id).fetch(request);
   }
@@ -36,407 +127,504 @@ export default {
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+
+    // websocket -> connectionId
     this.clients = new Map();
-    this.playerStates = new Map();
+
+    // 현재 방장
     this.hostId = "";
-    this.lastWorldSnapshot = null;
-    this.lastMonsterSnapshot = null;
-    this.lastBossSnapshot = null;
-    this.seenEvents = new Map();
-    this.attackWindows = new Map();
+
+    // connectionId -> state
+    this.states = new Map();
+
+    // partyId -> party
+    this.parties = new Map();
+
+    // connectionId -> last message time
+    this.lastMessageAt = new Map();
+
+    this.roomCode = "";
   }
 
-  broadcast(data, exceptSocket = null) {
-    for (const [socket] of this.clients) {
-      if (socket === exceptSocket) continue;
+  broadcast(payload, except = null) {
+    const data =
+      typeof payload === "string"
+        ? payload
+        : JSON.stringify(payload);
+
+    for (const [other] of this.clients) {
+      if (other === except) continue;
+
       try {
-        socket.send(data);
+        other.send(data);
       } catch {
-        this.removeSocket(socket);
+        this.removeClient(other);
       }
     }
   }
 
-  sendToPlayer(playerId, data) {
-    for (const [socket, id] of this.clients) {
-      if (String(id) !== String(playerId)) continue;
-      try {
-        socket.send(data);
-      } catch {
-        this.removeSocket(socket);
+  sendRoomSnapshot(server) {
+    const players = [];
+
+    for (const [ws, id] of this.clients) {
+      const state = this.states.get(id);
+
+      if (state) {
+        players.push(state);
       }
-      return true;
-    }
-    return false;
-  }
-
-  pruneEvents(now = Date.now()) {
-    for (const [id, ts] of this.seenEvents) {
-      if (now - ts > EVENT_TTL_MS) this.seenEvents.delete(id);
     }
 
-    while (this.seenEvents.size > MAX_EVENTS) {
-      const first = this.seenEvents.keys().next();
-      if (first.done) break;
-      this.seenEvents.delete(first.value);
-    }
-  }
-
-  isDuplicateEvent(requestId) {
-    if (!requestId) return false;
-
-    const id = String(requestId).slice(0, 160);
-    const now = Date.now();
-
-    this.pruneEvents(now);
-
-    if (this.seenEvents.has(id)) return true;
-
-    this.seenEvents.set(id, now);
-    return false;
-  }
-
-  allowAttack(playerId) {
-    const now = Date.now();
-    let w = this.attackWindows.get(String(playerId));
-
-    if (!w || now - w.start >= 1000) {
-      w = {
-        start: now,
-        count: 0
-      };
-
-      this.attackWindows.set(String(playerId), w);
-    }
-
-    w.count++;
-
-    return w.count <= ATTACKS_PER_SECOND;
-  }
-
-  sendRoomSnapshot(socket) {
-    try {
-      socket.send(
-        JSON.stringify({
-          type: "room_snapshot",
-          version: "246.1",
-          hostId: this.hostId,
-          players: [...this.playerStates.values()],
-          world: this.lastWorldSnapshot
-            ? safeJsonParse(this.lastWorldSnapshot)
-            : null,
-          monsters: this.lastMonsterSnapshot
-            ? safeJsonParse(this.lastMonsterSnapshot)?.monsters ?? null
-            : null,
-          bosses: this.lastBossSnapshot
-            ? safeJsonParse(this.lastBossSnapshot)?.bosses ?? null
-            : null
-        })
-      );
-    } catch {
-      this.removeSocket(socket);
-    }
-  }
-
-  removeSocket(socket) {
-    const id = this.clients.get(socket);
-    if (!id) return;
-
-    const wasHost =
-      String(id) === String(this.hostId);
-
-    this.clients.delete(socket);
-    this.playerStates.delete(String(id));
-    this.attackWindows.delete(String(id));
-
-    if (wasHost) {
-      const next = this.clients.values().next();
-
-      this.hostId = next.done
-        ? ""
-        : next.value;
-
-      this.lastWorldSnapshot = null;
-      this.lastMonsterSnapshot = null;
-      this.lastBossSnapshot = null;
-    }
-
-    this.broadcast(
-      JSON.stringify({
-        type: "player_left",
-        id: String(id),
-        players: this.clients.size,
-        maxPlayers: MAX_PLAYERS_PER_ROOM,
-        hostId: this.hostId
-      })
+    const party = this.getPartyForPlayer(
+      this.clients.get(server)
     );
 
-    if (wasHost && this.hostId) {
-      this.broadcast(
+    const partyMembers = party
+      ? [...party.members]
+      : [];
+
+    try {
+      server.send(
         JSON.stringify({
-          type: "room_host",
+          type: "room_snapshot",
           hostId: this.hostId,
-          players: this.clients.size,
-          maxPlayers: MAX_PLAYERS_PER_ROOM
+          players,
+
+          partyId: party?.id || "",
+          partyLeaderId:
+            party?.leaderId || "",
+          partyMembers,
+
+          maxPartyMembers: 4
         })
       );
+    } catch {}
+  }
+
+  getPartyForPlayer(playerId) {
+    if (!playerId) return null;
+
+    for (const [id, party] of this.parties) {
+      if (party.members.has(playerId)) {
+        return {
+          id,
+          ...party
+        };
+      }
     }
+
+    return null;
+  }
+
+  broadcastParty(partyId) {
+    const party = this.parties.get(partyId);
+
+    if (!party) return;
+
+    const payload = {
+      type: "party_state",
+      partyId,
+      leaderId: party.leaderId,
+      members: [...party.members],
+      maxMembers: 4
+    };
+
+    for (const [ws, id] of this.clients) {
+      if (!party.members.has(id)) continue;
+
+      try {
+        ws.send(JSON.stringify(payload));
+      } catch {
+        this.removeClient(ws);
+      }
+    }
+  }
+
+  leaveParty(playerId) {
+    const party = this.getPartyForPlayer(playerId);
+
+    if (!party) return;
+
+    const set = this.parties.get(party.id);
+
+    if (!set) return;
+
+    set.members.delete(playerId);
+
+    if (!set.members.size) {
+      this.parties.delete(party.id);
+    } else {
+      if (set.leaderId === playerId) {
+        set.leaderId =
+          [...set.members][0];
+      }
+
+      this.broadcastParty(party.id);
+    }
+  }
+
+  removeClient(server) {
+    const id = this.clients.get(server);
+
+    if (!id) return;
+
+    this.leaveParty(id);
+
+    this.states.delete(id);
+    this.lastMessageAt.delete(id);
+
+    const wasHost =
+      id === this.hostId;
+
+    this.clients.delete(server);
+
+    if (wasHost) {
+      const next =
+        this.clients.values().next();
+
+      this.hostId =
+        next.done
+          ? ""
+          : next.value;
+    }
+
+    this.broadcast({
+      type: "player_left",
+      id,
+      players: this.clients.size,
+      maxPlayers: MAX_PLAYERS_PER_ROOM,
+      hostId: this.hostId
+    });
+
+    const hostState =
+      this.states.get(this.hostId);
+
+    updateActiveRoom(
+      this.roomCode,
+      this.clients.size,
+      hostState?.name || ""
+    );
   }
 
   async fetch(request) {
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("WebSocket only", {
-        status: 426
-      });
-    }
+    const requestUrl =
+      new URL(request.url);
 
-    if (this.clients.size >= MAX_PLAYERS_PER_ROOM) {
+    const roomMatch =
+      requestUrl.pathname.match(
+        /^\/room\/([^/]+)$/
+      );
+
+    this.roomCode =
+      roomMatch
+        ? decodeURIComponent(roomMatch[1])
+        : this.roomCode;
+
+    if (
+      request.headers.get("Upgrade") !==
+      "websocket"
+    ) {
       return new Response(
-        "방이 가득 찼습니다. 최대 10명까지 입장할 수 있습니다.",
-        { status: 409 }
+        "WebSocket only",
+        {
+          status: 426
+        }
       );
     }
 
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    const connectionId = crypto.randomUUID();
+    if (
+      this.clients.size >=
+      MAX_PLAYERS_PER_ROOM
+    ) {
+      return new Response(
+        "방이 가득 찼습니다. 최대 10명까지 입장할 수 있습니다.",
+        {
+          status: 409
+        }
+      );
+    }
+
+    const pair =
+      new WebSocketPair();
+
+    const [client, server] =
+      Object.values(pair);
+
+    const connectionId =
+      crypto.randomUUID();
 
     server.accept();
 
-    this.clients.set(server, connectionId);
+    this.clients.set(
+      server,
+      connectionId
+    );
 
     if (!this.hostId) {
-      this.hostId = connectionId;
+      this.hostId =
+        connectionId;
     }
 
+    updateActiveRoom(
+      this.roomCode,
+      this.clients.size,
+      ""
+    );
+
+    // 연결 성공
     server.send(
       JSON.stringify({
         type: "connected",
-        version: "246.1",
-        players: this.clients.size,
-        maxPlayers: MAX_PLAYERS_PER_ROOM,
+        players:
+          this.clients.size,
+        maxPlayers:
+          MAX_PLAYERS_PER_ROOM,
         id: connectionId,
         hostId: this.hostId
       })
     );
 
+    // 현재 방 상태 전송
     this.sendRoomSnapshot(server);
 
+    // 다른 사람들에게 입장 알림
     this.broadcast(
-      JSON.stringify({
+      {
         type: "player_joined",
         id: connectionId,
-        players: this.clients.size,
-        maxPlayers: MAX_PLAYERS_PER_ROOM,
+        players:
+          this.clients.size,
+        maxPlayers:
+          MAX_PLAYERS_PER_ROOM,
         hostId: this.hostId
-      }),
+      },
       server
     );
 
-    server.addEventListener("message", (event) => {
-      if (typeof event.data !== "string") return;
+    server.addEventListener(
+      "message",
+      (event) => {
+        const id =
+          this.clients.get(server);
 
-      if (
-        new TextEncoder()
-          .encode(event.data)
-          .byteLength > MAX_MESSAGE_BYTES
-      ) {
-        return;
-      }
+        if (!id) return;
 
-      const msg = safeJsonParse(event.data);
+        const now = Date.now();
 
-      if (!msg || typeof msg !== "object") {
-        return;
-      }
+        const last =
+          this.lastMessageAt.get(id) ||
+          0;
 
-      const playerId =
-        this.clients.get(server);
+        // 기본적인 메시지 도배 방지
+        if (now - last < 15) {
+          return;
+        }
 
-      if (!playerId) return;
+        this.lastMessageAt.set(
+          id,
+          now
+        );
 
-      const type = String(msg.type || "");
+        let msg;
 
-      if (type === "state") {
-        const state = {
-          ...msg,
-          id: String(playerId),
-          hostId: this.hostId,
+        try {
+          msg =
+            JSON.parse(event.data);
+        } catch {
+          return;
+        }
 
-          x: Number(msg.x) || 0,
-          y: Number(msg.y) || 0,
+        if (
+          !msg ||
+          typeof msg !== "object"
+        ) {
+          return;
+        }
 
-          hp: Math.max(
+        // 플레이어 상태
+        if (msg.type === "state") {
+          // 서버가 ID를 강제로 결정
+          msg.id = id;
+          msg.hostId =
+            this.hostId;
+
+          msg.name =
+            String(
+              msg.name ||
+                "플레이어"
+            ).slice(0, 16);
+
+          msg.x =
+            Number.isFinite(
+              Number(msg.x)
+            )
+              ? Number(msg.x)
+              : 0;
+
+          msg.y =
+            Number.isFinite(
+              Number(msg.y)
+            )
+              ? Number(msg.y)
+              : 0;
+
+          msg.hp = Math.max(
             0,
-            Number(msg.hp) || 0
-          ),
-
-          maxHp: Math.max(
-            1,
-            Number(msg.maxHp) || 1
-          ),
-
-          mp: Math.max(
-            0,
-            Number(msg.mp) || 0
-          ),
-
-          maxMp: Math.max(
-            1,
-            Number(msg.maxMp) || 1
-          ),
-
-          st: Math.max(
-            0,
-            Number(msg.st) || 0
-          ),
-
-          maxSt: Math.max(
-            1,
-            Number(msg.maxSt) || 1
-          ),
-
-          updatedAt: Date.now()
-        };
-
-        this.playerStates.set(
-          String(playerId),
-          state
-        );
-
-        this.broadcast(
-          JSON.stringify(state),
-          server
-        );
-
-        return;
-      }
-
-      if (type === "world_snapshot") {
-        if (
-          String(playerId) !==
-          String(this.hostId)
-        ) {
-          return;
-        }
-
-        this.lastWorldSnapshot =
-          event.data;
-
-        this.broadcast(
-          event.data,
-          server
-        );
-
-        return;
-      }
-
-      if (type === "monster_state") {
-        if (
-          String(playerId) !==
-          String(this.hostId)
-        ) {
-          return;
-        }
-
-        this.lastMonsterSnapshot =
-          event.data;
-
-        this.broadcast(
-          event.data,
-          server
-        );
-
-        return;
-      }
-
-      if (type === "boss_state") {
-        if (
-          String(playerId) !==
-          String(this.hostId)
-        ) {
-          return;
-        }
-
-        this.lastBossSnapshot =
-          event.data;
-
-        this.broadcast(
-          event.data,
-          server
-        );
-
-        return;
-      }
-
-      if (
-        type === "monster_attack" ||
-        type === "boss_attack"
-      ) {
-        const attackerId =
-          String(msg.attackerId || "");
-
-        if (
-          attackerId !==
-          String(playerId)
-        ) {
-          return;
-        }
-
-        if (!this.allowAttack(attackerId)) {
-          return;
-        }
-
-        if (
-          this.isDuplicateEvent(
-            msg.requestId
-          )
-        ) {
-          return;
-        }
-
-        if (
-          String(playerId) !==
-          String(this.hostId)
-        ) {
-          this.sendToPlayer(
-            this.hostId,
-            event.data
+            Math.min(
+              100000000,
+              Number(msg.hp) || 0
+            )
           );
-        }
 
-        return;
-      }
+          msg.maxHp =
+            Math.max(
+              1,
+              Math.min(
+                100000000,
+                Number(msg.maxHp) || 1
+              )
+            );
 
-      if (
-        type === "monster_reward" ||
-        type === "boss_reward" ||
-        type === "player_damage" ||
-        type === "player_status"
-      ) {
-        if (
-          String(playerId) !==
-          String(this.hostId)
-        ) {
+          this.states.set(
+            id,
+            msg
+          );
+
+          const hostState =
+            this.states.get(
+              this.hostId
+            );
+
+          updateActiveRoom(
+            this.roomCode,
+            this.clients.size,
+            hostState?.name || ""
+          );
+
+          this.broadcast(
+            msg,
+            server
+          );
+
           return;
         }
 
+        // 채팅
+        if (msg.type === "chat") {
+          const text =
+            String(
+              msg.text || ""
+            )
+              .trim()
+              .slice(0, 120);
+
+          if (!text) return;
+
+          const state =
+            this.states.get(id);
+
+          this.broadcast({
+            type: "chat",
+            id,
+            name: String(
+              state?.name ||
+                "플레이어"
+            ).slice(0, 16),
+            text,
+            ts: now
+          });
+
+          return;
+        }
+
+        // 파티 생성 / 참가
+        if (
+          msg.type ===
+          "party_join"
+        ) {
+          let party =
+            this.getPartyForPlayer(
+              id
+            );
+
+          if (!party) {
+            const partyId =
+              `P-${crypto
+                .randomUUID()
+                .slice(
+                  0,
+                  8
+                )
+                .toUpperCase()}`;
+
+            const record = {
+              id: partyId,
+              leaderId: id,
+              members:
+                new Set([id])
+            };
+
+            this.parties.set(
+              partyId,
+              record
+            );
+
+            party = {
+              id: partyId,
+              ...record
+            };
+          } else if (
+            party.members.size < 4
+          ) {
+            const record =
+              this.parties.get(
+                party.id
+              );
+
+            record.members.add(id);
+
+            party = {
+              id: party.id,
+              ...record
+            };
+          }
+
+          this.broadcastParty(
+            party.id
+          );
+
+          return;
+        }
+
+        // 파티 탈퇴
+        if (
+          msg.type ===
+          "party_leave"
+        ) {
+          const party =
+            this.getPartyForPlayer(
+              id
+            );
+
+          if (party) {
+            this.leaveParty(id);
+          }
+
+          return;
+        }
+
+        // 나머지 게임 메시지
+        // 서버가 보낸 사람의 ID를 강제로 붙임
+        msg.senderId = id;
+
         this.broadcast(
-          event.data,
+          msg,
           server
         );
-
-        return;
       }
+    );
 
-      this.broadcast(
-        event.data,
-        server
-      );
-    });
-
-    const remove =
-      () => this.removeSocket(server);
+    const remove = () =>
+      this.removeClient(server);
 
     server.addEventListener(
       "close",
@@ -448,9 +636,12 @@ export class GameRoom extends DurableObject {
       remove
     );
 
-    return new Response(null, {
-      status: 101,
-      webSocket: client
-    });
+    return new Response(
+      null,
+      {
+        status: 101,
+        webSocket: client
+      }
+    );
   }
 }
