@@ -99,3 +99,4 @@ export class GameRoom extends DurableObject {
     });
   }
 }
+// Cloudflare Workers 첫 자동 배포
