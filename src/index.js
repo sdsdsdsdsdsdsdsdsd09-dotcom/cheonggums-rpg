@@ -94,7 +94,7 @@ function validateSaveEnvelope(envelope) {
 
   const p = gameSave.player;
   const level = Math.floor(clampNumber(p.level, 1, 100, 1));
-  const gold = Math.floor(clampNumber(p.gold, 0, 1500000, 0));
+  const gold = Math.floor(clampNumber(p.gold, 0, 3000000, 0));
   const maxHp = clampNumber(p.maxHp, 1, 100000000, 100);
   const hp = clampNumber(p.hp, 0, maxHp, 0);
   const maxMp = clampNumber(p.maxMp, 1, 100000000, 100);
@@ -231,8 +231,8 @@ export class GameRoom extends DurableObject {
     this.persistedMonsters = null;
     this.persistedBosses = null;
     this.trades = new Map();
+    this.recentRewardIds = new Set();
   }
-
 
   async loadRoomSnapshots() {
     if (this.persistedWorld === null) this.persistedWorld = await this.ctx.storage.get("roomWorldSnapshot") || null;
@@ -417,7 +417,6 @@ export class GameRoom extends DurableObject {
     }
   }
 
-
   getWsById(id) {
     for (const [ws, cid] of this.clients) if (cid === id) return ws;
     return null;
@@ -443,7 +442,7 @@ export class GameRoom extends DurableObject {
       const targetId = String(msg.targetId || "");
       if (!targetId || targetId === id || !this.getWsById(targetId)) return;
       const tradeId = String(msg.tradeId || crypto.randomUUID()).slice(0, 100);
-      const gold = Math.max(0, Math.min(1500000, Math.floor(Number(msg.offer?.gold) || 0)));
+      const gold = Math.max(0, Math.min(3000000, Math.floor(Number(msg.offer?.gold) || 0)));
       const itemId = String(msg.offer?.itemId || "").slice(0, 120);
       const amount = Math.max(0, Math.min(1000000, Math.floor(Number(msg.offer?.amount) || 0)));
       const record = { tradeId, a: id, b: targetId, offerA: { gold, itemId, amount }, offerB: { gold: 0, itemId: "", amount: 0 }, accepted: new Set() };
@@ -481,7 +480,7 @@ export class GameRoom extends DurableObject {
       const tradeId = String(msg.tradeId || "");
       const trade = this.trades.get(tradeId);
       if (!trade || (trade.a !== id && trade.b !== id)) return;
-      const offer = { gold: Math.max(0, Math.min(1500000, Math.floor(Number(msg.offer?.gold) || 0))), itemId: String(msg.offer?.itemId || "").slice(0,120), amount: Math.max(0, Math.min(1000000, Math.floor(Number(msg.offer?.amount) || 0))) };
+      const offer = { gold: Math.max(0, Math.min(3000000, Math.floor(Number(msg.offer?.gold) || 0))), itemId: String(msg.offer?.itemId || "").slice(0,120), amount: Math.max(0, Math.min(1000000, Math.floor(Number(msg.offer?.amount) || 0))) };
       if (id === trade.a) { trade.offerA = offer; trade.accepted.clear(); } else { trade.offerB = offer; trade.accepted.clear(); }
       const other = trade.a === id ? trade.b : trade.a;
       this.sendToId(other, { type: "trade_update_offer", tradeId, fromId: id, offer });
@@ -589,8 +588,35 @@ export class GameRoom extends DurableObject {
         return;
       }
 
+      // Only the room host may publish authoritative world/monster/boss snapshots.
+      // Non-host clients cannot overwrite shared monster HP or boss state.
       if (msg.type === "world_snapshot" || msg.type === "monster_state" || msg.type === "boss_state" || msg.type === "boss_snapshot") {
+        if (id !== this.hostId) return;
         this.persistWorldMessage(msg).catch(() => {});
+        msg.senderId = id;
+        this.broadcast(msg, server);
+        return;
+      }
+
+      // Reward packets are accepted only from the current host, deduplicated, and bounded.
+      // This closes the direct non-host reward-injection path; full anti-cheat requires
+      // moving combat simulation to the server instead of trusting the host client.
+      if (msg.type === "monster_reward") {
+        if (id !== this.hostId) return;
+        const rewardId = String(msg.rewardId || "").slice(0, 180);
+        if (!rewardId || this.recentRewardIds.has(rewardId)) return;
+        this.recentRewardIds.add(rewardId);
+        if (this.recentRewardIds.size > 2000) this.recentRewardIds.clear();
+        msg.hostId = this.hostId;
+        msg.xp = Math.floor(clampNumber(msg.xp, 0, 100000, 0));
+        msg.gold = Math.floor(clampNumber(msg.gold, 0, 3000000, 0));
+        msg.drops = Array.isArray(msg.drops) ? msg.drops.slice(0, 20).map(d => ({
+          id: String(d?.id || "").slice(0, 100),
+          amount: Math.floor(clampNumber(d?.amount, 0, 1000, 0)),
+        })).filter(d => d.id && d.amount > 0) : [];
+        msg.senderId = id;
+        this.broadcast(msg, server);
+        return;
       }
 
       if (msg.type === "party_join") {
